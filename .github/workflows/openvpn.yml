@@ -30,13 +30,12 @@ jobs:
       - name: "Checkout repository"
         uses: actions/checkout@v4
 
-      - name: "Install OpenVPN, Easy-RSA & Dependencies"
+      - name: "Install OpenVPN & Dependencies"
         run: |
           echo "::group::Installing Packages"
           sudo apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             openvpn \
-            easy-rsa \
             iptables \
             curl \
             net-tools
@@ -61,27 +60,55 @@ jobs:
           echo "✅ NAT masquerading & IP forwarding enabled."
           echo "::endgroup::"
 
-      - name: "Generate PKI & Certificates (OpenSSL)"
+      - name: "Generate RFC-Compliant X509v3 PKI & Certificates"
         run: |
-          echo "::group::Generating Certificates and Keys"
+          echo "::group::Generating Certificates and Keys with X509v3 Extensions"
           mkdir -p /tmp/openvpn-pki
           cd /tmp/openvpn-pki
 
+          # Create OpenSSL configuration with strict X509v3 extensions for OpenVPN
+          cat << 'EOF' > openssl.cnf
+          [ req ]
+          distinguished_name = req_distinguished_name
+
+          [ req_distinguished_name ]
+
+          [ v3_ca ]
+          subjectKeyIdentifier = hash
+          authorityKeyIdentifier = keyid:always,issuer
+          basicConstraints = critical, CA:true
+          keyUsage = critical, digitalSignature, cRLSign, keyCertSign
+
+          [ v3_server ]
+          basicConstraints = CA:FALSE
+          subjectKeyIdentifier = hash
+          authorityKeyIdentifier = keyid,issuer:always
+          extendedKeyUsage = serverAuth
+          keyUsage = critical, digitalSignature, keyEncipherment
+
+          [ v3_client ]
+          basicConstraints = CA:FALSE
+          subjectKeyIdentifier = hash
+          authorityKeyIdentifier = keyid,issuer:always
+          extendedKeyUsage = clientAuth
+          keyUsage = critical, digitalSignature
+          EOF
+
           # 1. CA Key & Certificate
           openssl genrsa -out ca.key 2048
-          openssl req -new -x509 -days 3650 -key ca.key -out ca.crt -subj "/CN=GitHub-Actions-OpenVPN-CA"
+          openssl req -new -x509 -days 3650 -key ca.key -out ca.crt -subj "/CN=GitHub-Actions-OpenVPN-CA" -config openssl.cnf -extensions v3_ca
 
-          # 2. Server Key & Certificate
+          # 2. Server Key & Certificate (with serverAuth & digitalSignature)
           openssl genrsa -out server.key 2048
-          openssl req -new -key server.key -out server.csr -subj "/CN=openvpn-server"
-          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 365
+          openssl req -new -key server.key -out server.csr -subj "/CN=openvpn-server" -config openssl.cnf
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 365 -extfile openssl.cnf -extensions v3_server
 
-          # 3. Client Key & Certificate
+          # 3. Client Key & Certificate (with clientAuth & digitalSignature)
           openssl genrsa -out client.key 2048
-          openssl req -new -key client.key -out client.csr -subj "/CN=client-mac"
-          openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt -days 365
+          openssl req -new -key client.key -out client.csr -subj "/CN=client-mac" -config openssl.cnf
+          openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt -days 365 -extfile openssl.cnf -extensions v3_client
 
-          # 4. Diffie-Hellman Parameters (fast 2048-bit)
+          # 4. Diffie-Hellman Parameters (2048-bit)
           openssl dhparam -out dh2048.pem 2048
 
           # 5. Move keys into OpenVPN directory
@@ -89,7 +116,7 @@ jobs:
           sudo cp ca.crt server.crt server.key dh2048.pem /etc/openvpn/server/
           sudo chmod 600 /etc/openvpn/server/server.key
 
-          echo "✅ PKI & Certificates generated."
+          echo "✅ Validated X509v3 PKI generated."
           echo "::endgroup::"
 
       - name: "Configure & Start OpenVPN Server (TCP)"
@@ -208,8 +235,6 @@ jobs:
           remote 127.0.0.1 $PORT
           resolv-retry infinite
           nobind
-          persist-key
-          persist-tun
           remote-cert-tls server
           cipher AES-256-GCM
           verb 3
