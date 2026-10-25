@@ -1,0 +1,6 @@
+# VPN profiles and local secrets
+*.ovpn
+.cf_hostname
+*.log
+/tmp/
+.DS_Store

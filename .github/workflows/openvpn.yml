@@ -1,0 +1,295 @@
+name: "OpenVPN Server via Cloudflare Tunnel"
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Duration to keep the OpenVPN server alive (in minutes)"
+        required: true
+        default: "360"
+        type: choice
+        options:
+          - "30"
+          - "60"
+          - "120"
+          - "180"
+          - "360"
+      vpn_port:
+        description: "OpenVPN TCP Port"
+        required: true
+        default: "1194"
+        type: string
+
+jobs:
+  openvpn-server:
+    name: "OpenVPN Server (Cloudflare Tunnel)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Validate Cloudflare Secrets"
+        run: |
+          if [ -z "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" ]; then
+            echo "::error::CLOUDFLARE_TUNNEL_TOKEN secret is missing! Please configure it in GitHub Repository Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          echo "✅ CLOUDFLARE_TUNNEL_TOKEN secret is configured."
+
+      - name: "Install OpenVPN, Easy-RSA & Dependencies"
+        run: |
+          echo "::group::Installing Packages"
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            openvpn \
+            easy-rsa \
+            iptables \
+            curl \
+            net-tools \
+            qrencode
+          echo "::endgroup::"
+
+      - name: "Enable Kernel IP Forwarding & NAT Routing"
+        run: |
+          echo "::group::Configuring Networking & IP Forwarding"
+          # Enable IPv4 forwarding
+          sudo sysctl -w net.ipv4.ip_forward=1
+          echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf
+
+          # Determine the default outbound network interface
+          DEFAULT_IF=$(ip route | grep default | awk '{print $5}' | head -n 1)
+          echo "Default outbound network interface: $DEFAULT_IF"
+
+          # Configure iptables NAT masquerading for VPN subnet 10.8.0.0/24
+          sudo iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o "$DEFAULT_IF" -j MASQUERADE
+          sudo iptables -A FORWARD -s 10.8.0.0/24 -j ACCEPT
+          sudo iptables -A FORWARD -d 10.8.0.0/24 -m state --state RELATED,ESTABLISHED -j ACCEPT
+
+          echo "✅ NAT masquerading & IP forwarding enabled."
+          echo "::endgroup::"
+
+      - name: "Generate PKI & Certificates (OpenSSL / Easy-RSA)"
+        run: |
+          echo "::group::Generating Certificates and Keys"
+          mkdir -p /tmp/openvpn-pki
+          cd /tmp/openvpn-pki
+
+          # 1. CA Key & Certificate
+          openssl genrsa -out ca.key 2048
+          openssl req -new -x509 -days 3650 -key ca.key -out ca.crt -subj "/CN=GitHub-Actions-OpenVPN-CA"
+
+          # 2. Server Key & Certificate
+          openssl genrsa -out server.key 2048
+          openssl req -new -key server.key -out server.csr -subj "/CN=openvpn-server"
+          openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 365
+
+          # 3. Client Key & Certificate
+          openssl genrsa -out client.key 2048
+          openssl req -new -key client.key -out client.csr -subj "/CN=client-mac"
+          openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt -days 365
+
+          # 4. Diffie-Hellman Parameters (fast 2048-bit)
+          openssl dhparam -out dh2048.pem 2048
+
+          # 5. Move keys into OpenVPN directory
+          sudo mkdir -p /etc/openvpn/server
+          sudo cp ca.crt server.crt server.key dh2048.pem /etc/openvpn/server/
+          sudo chmod 600 /etc/openvpn/server/server.key
+
+          echo "✅ PKI & Certificates generated."
+          echo "::endgroup::"
+
+      - name: "Configure & Start OpenVPN Server (TCP)"
+        env:
+          PORT: ${{ github.event.inputs.vpn_port || '1194' }}
+        run: |
+          echo "::group::Configuring OpenVPN Server"
+          cat << EOF | sudo tee /etc/openvpn/server/server.conf
+          port $PORT
+          proto tcp-server
+          dev tun
+          ca /etc/openvpn/server/ca.crt
+          cert /etc/openvpn/server/server.crt
+          key /etc/openvpn/server/server.key
+          dh /etc/openvpn/server/dh2048.pem
+          server 10.8.0.0 255.255.255.0
+          ifconfig-pool-persist /var/log/openvpn-ipp.txt
+          push "redirect-gateway def1 bypass-dhcp"
+          push "dhcp-option DNS 1.1.1.1"
+          push "dhcp-option DNS 1.0.0.1"
+          keepalive 10 120
+          cipher AES-256-GCM
+          data-ciphers AES-256-GCM:AES-128-GCM
+          persist-key
+          persist-tun
+          status /var/log/openvpn-status.log
+          log /var/log/openvpn.log
+          verb 3
+          mute 20
+          EOF
+
+          # Start OpenVPN Server in background
+          sudo openvpn --config /etc/openvpn/server/server.conf &
+          VPN_PID=$!
+          echo "OpenVPN started with PID: $VPN_PID"
+
+          # Verify OpenVPN is listening
+          sleep 3
+          if ! sudo netstat -tlpn | grep ":$PORT "; then
+            echo "::error::OpenVPN failed to listen on port $PORT"
+            sudo cat /var/log/openvpn.log
+            exit 1
+          fi
+          echo "✅ OpenVPN Server is listening on TCP port $PORT."
+          echo "::endgroup::"
+
+      - name: "Install & Run Cloudflare Tunnel (cloudflared)"
+        env:
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+        run: |
+          echo "::group::Install cloudflared"
+          curl -sL --output /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+          rm -f /tmp/cloudflared.deb
+          echo "cloudflared installed version: $(cloudflared --version)"
+          echo "::endgroup::"
+
+          echo "::group::Launch Cloudflare Tunnel"
+          cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+          CF_PID=$!
+          echo "Cloudflare Tunnel started with PID: $CF_PID"
+
+          sleep 5
+          if ! ps -p $CF_PID > /dev/null; then
+            echo "::error::cloudflared exited immediately. Log output:"
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+          echo "✅ Cloudflare Tunnel is connected and operational."
+          echo "::endgroup::"
+
+      - name: "Generate Standalone Client .ovpn Profile"
+        env:
+          PORT: ${{ github.event.inputs.vpn_port || '1194' }}
+        run: |
+          echo "::group::Creating client.ovpn"
+          mkdir -p client-config
+
+          CA_DATA=$(cat /tmp/openvpn-pki/ca.crt)
+          CERT_DATA=$(openssl x509 -in /tmp/openvpn-pki/client.crt)
+          KEY_DATA=$(cat /tmp/openvpn-pki/client.key)
+
+          cat << EOF > client-config/client.ovpn
+          client
+          dev tun
+          proto tcp-client
+          remote 127.0.0.1 $PORT
+          resolv-retry infinite
+          nobind
+          persist-key
+          persist-tun
+          remote-cert-tls server
+          cipher AES-256-GCM
+          verb 3
+          redirect-gateway def1 bypass-dhcp
+
+          <ca>
+          $CA_DATA
+          </ca>
+
+          <cert>
+          $CERT_DATA
+          </cert>
+
+          <key>
+          $KEY_DATA
+          </key>
+          EOF
+
+          echo "✅ client.ovpn profile created successfully."
+          echo "::endgroup::"
+
+      - name: "Upload Client Profile Artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: openvpn-client-profile
+          path: client-config/client.ovpn
+          retention-days: 1
+
+      - name: "Summary & Connection Instructions"
+        env:
+          PORT: ${{ github.event.inputs.vpn_port || '1194' }}
+          MINUTES: ${{ github.event.inputs.duration_minutes || '360' }}
+        run: |
+          cat << 'EOF' >> $GITHUB_STEP_SUMMARY
+          # 🚀 OpenVPN Cloud Server is ONLINE!
+
+          Protected & Forwarded via **Cloudflare Zero Trust Tunnel** (`cloudflared`).
+
+          ---
+
+          ### 📥 1. Download Client Profile
+          Download the **`openvpn-client-profile`** artifact from the Artifacts section at the top of this run.
+
+          ---
+
+          ### 💻 2. Connect from MacBook (2 Simple Steps):
+
+          **Step A: Forward Cloudflare Tunnel to Localhost**
+          \`\`\`bash
+          # Run in Terminal:
+          cloudflared access tcp --hostname <YOUR_CLOUDFLARE_HOSTNAME> --url 127.0.0.1:1194
+          \`\`\`
+          *(Replace `<YOUR_CLOUDFLARE_HOSTNAME>` with the hostname configured on your Cloudflare Tunnel, e.g. `vpn.yourdomain.com`)*
+
+          **Step B: Connect OpenVPN**
+          - Open the downloaded **`client.ovpn`** using **OpenVPN Connect for Mac** or **Tunnelblick**.
+          - Click **Connect**.
+          - Verify your egress IP:
+          \`\`\`bash
+          curl https://icanhazip.com
+          \`\`\`
+          *(It will now show the GitHub Actions / Azure Datacenter Public IP)*
+
+          ---
+
+          - **Duration**: $MINUTES minutes
+          - **Tunnel**: Cloudflare Zero Trust
+          - **Protocol**: OpenVPN over TCP
+          EOF
+
+      - name: "Keep-Alive Loop with Health Check"
+        run: |
+          MINUTES="${{ github.event.inputs.duration_minutes || '360' }}"
+          TOTAL_SECONDS=$((MINUTES * 60))
+          ELAPSED=0
+
+          echo "=========================================================="
+          echo "🟢 OPENVPN SERVER RUNNING IN GITHUB ACTIONS!"
+          echo "Duration: $MINUTES minutes"
+          echo "Traffic is routing through GitHub/Azure network"
+          echo "=========================================================="
+
+          while [ $ELAPSED -lt $TOTAL_SECONDS ]; do
+            sleep 30
+            ELAPSED=$((ELAPSED + 30))
+            REMAINING=$(( (TOTAL_SECONDS - ELAPSED) / 60 ))
+
+            # Health checks
+            if ! pgrep -f "openvpn" > /dev/null; then
+              echo "::error::OpenVPN server process stopped!"
+              sudo cat /var/log/openvpn.log
+              exit 1
+            fi
+            if ! pgrep -f "cloudflared" > /dev/null; then
+              echo "::error::cloudflared tunnel process stopped!"
+              cat /tmp/cloudflared.log
+              exit 1
+            fi
+
+            echo "[$(date +'%Y-%m-%d %H:%M:%S')] 🟢 OpenVPN & Cloudflare Tunnel Healthy. Remaining: ~$REMAINING min"
+          done
+
+          echo "Time limit reached. Tearing down OpenVPN session."
