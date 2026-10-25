@@ -30,14 +30,6 @@ jobs:
       - name: "Checkout repository"
         uses: actions/checkout@v4
 
-      - name: "Validate Cloudflare Secrets"
-        run: |
-          if [ -z "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}" ]; then
-            echo "::error::CLOUDFLARE_TUNNEL_TOKEN secret is missing! Please configure it in GitHub Repository Settings -> Secrets and variables -> Actions."
-            exit 1
-          fi
-          echo "✅ CLOUDFLARE_TUNNEL_TOKEN secret is configured."
-
       - name: "Install OpenVPN, Easy-RSA & Dependencies"
         run: |
           echo "::group::Installing Packages"
@@ -47,8 +39,7 @@ jobs:
             easy-rsa \
             iptables \
             curl \
-            net-tools \
-            qrencode
+            net-tools
           echo "::endgroup::"
 
       - name: "Enable Kernel IP Forwarding & NAT Routing"
@@ -70,7 +61,7 @@ jobs:
           echo "✅ NAT masquerading & IP forwarding enabled."
           echo "::endgroup::"
 
-      - name: "Generate PKI & Certificates (OpenSSL / Easy-RSA)"
+      - name: "Generate PKI & Certificates (OpenSSL)"
         run: |
           echo "::group::Generating Certificates and Keys"
           mkdir -p /tmp/openvpn-pki
@@ -146,8 +137,10 @@ jobs:
           echo "::endgroup::"
 
       - name: "Install & Run Cloudflare Tunnel (cloudflared)"
+        id: tunnel
         env:
           CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          PORT: ${{ github.event.inputs.vpn_port || '1194' }}
         run: |
           echo "::group::Install cloudflared"
           curl -sL --output /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
@@ -157,17 +150,44 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Launch Cloudflare Tunnel"
-          cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
-          CF_PID=$!
-          echo "Cloudflare Tunnel started with PID: $CF_PID"
+          if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
+            echo "Starting Cloudflare Zero Trust Tunnel with permanent token..."
+            cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/cloudflared.log 2>&1 &
+            CF_PID=$!
+            sleep 5
+            if ! ps -p $CF_PID > /dev/null; then
+              echo "::error::cloudflared exited immediately. Log output:"
+              cat /tmp/cloudflared.log
+              exit 1
+            fi
+            echo "CF_MODE=token" >> $GITHUB_ENV
+            echo "TUNNEL_HOST=your-configured-hostname" >> $GITHUB_ENV
+            echo "✅ Named Cloudflare Zero Trust Tunnel is connected."
+          else
+            echo "No CLOUDFLARE_TUNNEL_TOKEN detected. Starting instant Cloudflare Quick Tunnel (trycloudflare.com)..."
+            cloudflared tunnel --no-autoupdate --url "tcp://localhost:$PORT" > /tmp/cloudflared.log 2>&1 &
+            CF_PID=$!
+            
+            CF_URL=""
+            for i in {1..30}; do
+              CF_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" /tmp/cloudflared.log | head -n 1 || true)
+              if [ -n "$CF_URL" ]; then
+                break
+              fi
+              sleep 2
+            done
 
-          sleep 5
-          if ! ps -p $CF_PID > /dev/null; then
-            echo "::error::cloudflared exited immediately. Log output:"
-            cat /tmp/cloudflared.log
-            exit 1
+            if [ -z "$CF_URL" ]; then
+              echo "::error::Failed to establish Quick Tunnel. Logs:"
+              cat /tmp/cloudflared.log
+              exit 1
+            fi
+
+            TUNNEL_HOST=$(echo "$CF_URL" | sed 's|https://||')
+            echo "CF_MODE=quick" >> $GITHUB_ENV
+            echo "TUNNEL_HOST=$TUNNEL_HOST" >> $GITHUB_ENV
+            echo "✅ Instant Cloudflare Quick Tunnel active on: $TUNNEL_HOST"
           fi
-          echo "✅ Cloudflare Tunnel is connected and operational."
           echo "::endgroup::"
 
       - name: "Generate Standalone Client .ovpn Profile"
@@ -208,6 +228,9 @@ jobs:
           </key>
           EOF
 
+          # Also write client configuration info
+          echo "${{ env.TUNNEL_HOST }}" > client-config/hostname.txt
+
           echo "✅ client.ovpn profile created successfully."
           echo "::endgroup::"
 
@@ -215,49 +238,44 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: openvpn-client-profile
-          path: client-config/client.ovpn
+          path: client-config/
           retention-days: 1
 
       - name: "Summary & Connection Instructions"
         env:
           PORT: ${{ github.event.inputs.vpn_port || '1194' }}
           MINUTES: ${{ github.event.inputs.duration_minutes || '360' }}
+          HOST: ${{ env.TUNNEL_HOST }}
         run: |
-          cat << 'EOF' >> $GITHUB_STEP_SUMMARY
+          cat << EOF >> $GITHUB_STEP_SUMMARY
           # 🚀 OpenVPN Cloud Server is ONLINE!
 
-          Protected & Forwarded via **Cloudflare Zero Trust Tunnel** (`cloudflared`).
+          Protected & Forwarded via **Cloudflare Tunnel** (\`cloudflared\`).
+
+          ---
+
+          ### 🌐 Tunnel Hostname:
+          \`\`\`
+          $HOST
+          \`\`\`
 
           ---
 
           ### 📥 1. Download Client Profile
-          Download the **`openvpn-client-profile`** artifact from the Artifacts section at the top of this run.
+          Download the **\`openvpn-client-profile\`** artifact from the Artifacts section at the top of this run.
 
           ---
 
-          ### 💻 2. Connect from MacBook (2 Simple Steps):
+          ### 💻 2. Connect from MacBook:
 
-          **Step A: Forward Cloudflare Tunnel to Localhost**
           \`\`\`bash
-          # Run in Terminal:
-          cloudflared access tcp --hostname <YOUR_CLOUDFLARE_HOSTNAME> --url 127.0.0.1:1194
+          ./connect-mac.sh $HOST
           \`\`\`
-          *(Replace `<YOUR_CLOUDFLARE_HOSTNAME>` with the hostname configured on your Cloudflare Tunnel, e.g. `vpn.yourdomain.com`)*
-
-          **Step B: Connect OpenVPN**
-          - Open the downloaded **`client.ovpn`** using **OpenVPN Connect for Mac** or **Tunnelblick**.
-          - Click **Connect**.
-          - Verify your egress IP:
-          \`\`\`bash
-          curl https://icanhazip.com
-          \`\`\`
-          *(It will now show the GitHub Actions / Azure Datacenter Public IP)*
 
           ---
-
           - **Duration**: $MINUTES minutes
-          - **Tunnel**: Cloudflare Zero Trust
-          - **Protocol**: OpenVPN over TCP
+          - **Tunnel Mode**: ${{ env.CF_MODE }}
+          - **Protocol**: OpenVPN over TCP ($PORT)
           EOF
 
       - name: "Keep-Alive Loop with Health Check"
@@ -268,6 +286,7 @@ jobs:
 
           echo "=========================================================="
           echo "🟢 OPENVPN SERVER RUNNING IN GITHUB ACTIONS!"
+          echo "Tunnel Host: ${{ env.TUNNEL_HOST }}"
           echo "Duration: $MINUTES minutes"
           echo "Traffic is routing through GitHub/Azure network"
           echo "=========================================================="
@@ -292,4 +311,4 @@ jobs:
             echo "[$(date +'%Y-%m-%d %H:%M:%S')] 🟢 OpenVPN & Cloudflare Tunnel Healthy. Remaining: ~$REMAINING min"
           done
 
-          echo "Time limit reached. Tearing down OpenVPN session."
+          echo "Session duration completed. Tearing down OpenVPN session."
